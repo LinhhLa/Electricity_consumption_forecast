@@ -1,0 +1,315 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# Loading library for data preperation and analysis
+```{r}
+library(fpp3)
+library(readxl)
+library(ggplot2)
+library(tsibble)
+library(lubridate)
+library(purrr)
+library(dbplyr)
+library(urca)
+```
+
+
+#Import data
+```{r}
+Helsinki = read.csv('Helsinki Kaisaniemi observations.csv')
+#view(Helsinki)
+Rovaniemi = read.csv("Rovaniemi rautatieasema observations.csv")
+#view(Rovaniemi)
+Tampere = read.csv("Tampere Siilinkari observations.csv")
+#view(Tampere)
+consumption = read.csv('consumption.csv')
+#view(consumption)
+temperature_forecast = read.csv('forecasts.csv')
+#view(temperature_forecast)
+```
+
+
+#Data processing
+```{r}
+temp_data2 <- bind_rows(Helsinki, Rovaniemi, Tampere, .id = NULL)
+
+# summarize temperature data
+temp_data2 <- temp_data2 |>
+  mutate(Date = as_date(paste(Year, Month, Day, sep = "-"))) 
+temp_daily_summary2 <- temp_data2 |>
+  group_by(Place, Date) |>
+  summarise(mean_temp = mean(Mean.temperature))
+temp_daily_summary2
+```
+
+
+```{r}
+historical_temp <- temp_daily_summary2 |>
+  pivot_wider(names_from = Place, values_from = mean_temp)
+historical_temp
+```
+
+
+
+# process consumption
+
+```{r}
+consumption
+view(consumption)
+```
+
+```{r}
+consumption_formatted <- consumption |>
+  mutate(
+    End.time.UTC = as.POSIXct(End.time.UTC, format = "%Y-%m-%dT%H:%M:%OSZ"),
+    End.time.UTC = format(End.time.UTC, format = "%Y-%m-%d %H:%M")
+  )
+# Convert Date column to POSIXct format
+consumption_formatted <- consumption_formatted |>
+  mutate(
+    End.time.UTC = as.POSIXct(End.time.UTC, origin = "2019-12-31", tz = "UTC")
+  ) |>
+  filter(any(minute(End.time.UTC) %in% c(55)))  |>
+  mutate(
+    # Adjusting dates where minute is 55 by adding 5 minutes
+    Date = if_else(minute(End.time.UTC) == 55, End.time.UTC + minutes(5), End.time.UTC)
+  )
+
+```
+
+```{r}
+consumption_formatted <- consumption_formatted |>
+  mutate(date2 = format(Date, "%Y-%m-%d"),
+         hour = format(Date, "%H"))
+  
+# group and take avg for each hour
+consumption_formatted <- consumption_formatted |>  
+  group_by(date2, hour) |>
+  summarise(consumption = mean(Electricity.consumption.in.Finland)) 
+```
+
+```{r}
+consumption_formatted <- consumption_formatted |>
+  group_by(date2) |>
+  summarise(consumption = sum(consumption)) |>
+  na.omit()
+view(consumption_formatted)
+```
+
+```{r}
+consumption_formatted <- consumption_formatted[c(3:(nrow(consumption_formatted) - 1)), ]
+glimpse(consumption_formatted)
+```
+
+```{r}
+# rename date col
+consumption_formatted <- consumption_formatted |> rename("Date" = date2)
+```
+
+```{r}
+# merge files
+merged_df <- merge(consumption_formatted, historical_temp, by = "Date", all =TRUE)
+view(merged_consumption)
+```
+
+```{r}
+merged_df <- merged_df |>
+  mutate(Date = as.Date(Date, format = "%Y-%m-%d"),
+         log_consumption = log(consumption)) |>
+  as_tsibble(index = Date) |>
+  rename('Helsinki' = `Helsinki Kaisaniemi`,
+         'Tampere' = `Tampere Siilinkari`,
+         'Rovaniemi' = `Rovaniemi rautatieasema`,
+         'Consumption' = consumption) #Rename the Temperature column so it matches
+glimpse(merged_df)
+```
+#Forecast
+
+```{r}
+temperature_forecast <- temperature_forecast |>
+  mutate(Forecast.day.ahead = as.POSIXct(Forecast.day.ahead, format = "%d/%m/%Y %H:%M"),
+         Date = as.Date(Forecast.day.ahead)) |>
+  group_by(Date) |> 
+  summarize(Helsinki = round(mean(Helsinki, na.rm = TRUE), 1),
+            Tampere = round(mean(Tampere, na.rm = TRUE), 1),
+            Rovaniemi = round(mean(Rovaniemi, na.rm = TRUE), 1)) |>
+  na.omit() |> 
+  as_tsibble(index = Date)
+  
+
+glimpse(temperature_forecast)
+```
+
+
+
+
+#Visualization
+```{r}
+# Plot Consumption over Date
+merged_df|>autoplot(Consumption)  +
+  labs(x = "Time", y = "Daily Electricity demand", title = "Finland's daily electricity demand")
+```
+
+
+```{r}
+merged_df |>
+  gg_season(Consumption)
+```
+
+
+#Train test split 
+```{r}
+#use the entire dataset to train
+train <- merged_df
+
+train <- merged_df |> #This is used to for checking only
+  filter(Date <= (max(Date) - 2)) 
+```
+
+
+#ARIMA
+```{r}
+merged_df |>
+  transmute(
+    `C` = Consumption,
+    `Log C` = log(Consumption),
+    `Weekly change in log C` = difference(log(Consumption), 1),
+    `Doubly differenced log C` =
+                     difference(difference(log(Consumption), 1), 1)
+  ) |>
+  pivot_longer(-Date, names_to="Type", values_to="Consumption") |>
+  mutate(
+    Type = factor(Type, levels = c(
+      "C",
+      "Log C",
+      "Diff C",
+      "Weekly change in log C",
+      "Doubly differenced log C"))
+  ) |>
+  ggplot(aes(x = Date, y = Consumption)) +
+  geom_line() +
+  facet_grid(vars(Type), scales = "free_y") +
+  labs(title = "Finland electricity consumption", y = NULL)
+```
+
+
+# Test stationality H0: time series is stationary (p<0.05 => data is non-stationary)
+```{r}
+merged_df |> features(Consumption, unitroot_kpss)
+```
+
+
+#Take the log difference and run the test again (p <0.0 => data is non-stationary)
+```{r}
+merged_df |> 
+  mutate(diff_consumption = difference(log(Consumption))) |>
+  features(diff_consumption, unitroot_kpss)
+```
+
+#Find the number of differencing needed to stablize the data
+```{r}
+merged_df |> features(Consumption, unitroot_ndiffs)
+```
+
+
+
+#Do the same for log consumption (if unitroot_ndiffs still != 0, then take another difference)
+```{r}
+merged_df|> 
+  mutate(log_consumption = log(Consumption)) |>
+  features(Consumption, unitroot_ndiffs)
+
+merged_df |>
+  mutate(log_consumption = difference(log(Consumption), 7)) |>
+  features(Consumption, unitroot_ndiffs)
+```
+
+
+#Another way for stability suggestions (still not sure how to use this yet)
+```{r}
+merged_df |> features(log_consumption, feat_stl)
+```
+
+
+
+#Finding the components of the arima model (find the pdq, and PDQ values )
+```{r}
+merged_df |> gg_tsdisplay(difference(log(Consumption),7) , plot_type ='partial', lag = 60)
+```
+
+
+```{r}
+merged_df |> gg_tsdisplay(difference(log(Consumption),7) |> difference() , plot_type ='partial', lag = 60)
+```
+
+
+# Final forecasting model
+```{r}
+fit_arima <- train |> 
+  model(
+    ARIMA(log_consumption ~ 0 + `Helsinki` + `Tampere` + `Rovaniemi` + `Helsinki`:`Tampere`+ pdq(0, 1, 1) + PDQ(0,1,1)),
+  )
+#AIC and BIC report
+report(fit_arima, merged_df)
+```
+
+
+```{r}
+#Residuals
+fit_arima |> gg_tsresiduals()
+```
+
+
+```{r}
+#glance(fit_arima) |> arrange(AICc) |> select(.model:BIC)
+```
+
+#Generate forecast
+
+```{r}
+#Testing for to forcast N-1 and N in the dataset with forecast temperature file  
+#We can use this to extract the last two days from the forecast temperature csv file without having to manually input in the data as well
+forecast_data <- tail(temperature_forecast, 2)
+```
+
+
+```{r}
+#For testing accuracy
+ fc_12 <- forecast(fit_arima, forecast_data)
+accuracy(fc_12, merged_df) |> select(-.model)
+```
+
+
+
+```{r}
+#forecast_data <- new_data(merged_df, 2) |> #Manually input if the aboved function failed
+#  mutate(Helsinki = c(-0.2,0.7), Tampere= c(-1.2,1) , Rovaniemi = c(-1,0))
+
+
+fc_12 <- forecast(fit_arima, forecast_data) |>
+  mutate(parameters = purrr::map_dfr(log_consumption, distributional::parameters))
+
+#print the mean and std of the forecast
+c(fc_12$.mean, fc_12$parameters)
+
+```
+
+
+
+```{r}
+forecast(fit_arima, forecast_data)  |> autoplot(merged_df |> filter(Date >='2024-02-26'))
+```
+
+
+
+
+
+
+
+
+
+
+
+
